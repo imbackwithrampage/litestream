@@ -11,6 +11,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 
 FROM alpine
+RUN apk add --no-cache sqlite # for debugging
 COPY --from=builder /usr/local/bin/litestream /usr/local/bin/litestream
 ENTRYPOINT ["/usr/local/bin/litestream"]
 CMD []
