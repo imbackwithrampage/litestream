@@ -31,7 +31,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
-	verbose := fs.Bool("v", false, "verbose output")
+	verbose := fs.Bool("v", true, "verbose output")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
