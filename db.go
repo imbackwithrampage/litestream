@@ -1512,7 +1512,6 @@ type RestoreOptions struct {
 
 	// Logging settings.
 	Logger  *log.Logger
-	Verbose bool
 }
 
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.
