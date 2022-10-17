@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"filippo.io/age"
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
@@ -67,6 +68,10 @@ type Replica struct {
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
 	MonitorEnabled bool
+
+	// Encryption identities and recipients
+	AgeIdentities []age.Identity
+	AgeRecipients []age.Recipient
 }
 
 func NewReplica(db *DB, name string) *Replica {
@@ -226,8 +231,20 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 		return err
 	})
 
+	var ew io.WriteCloser = pw
+
+	// Add encryption if we have recipients.
+	if len(r.AgeRecipients) > 0 {
+		var err error
+		ew, err = age.Encrypt(pw, r.AgeRecipients...)
+		defer ew.Close()
+		if err != nil {
+			return err
+		}
+	}
+
 	// Wrap writer to LZ4 compress.
-	zw := lz4.NewWriter(pw)
+	zw := lz4.NewWriter(ew)
 
 	// Track total WAL bytes written to replica client.
 	walBytesCounter := replicaWALBytesCounterVec.WithLabelValues(r.db.Path(), r.Name())
@@ -277,8 +294,10 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 		bytesWritten += n
 	}
 
-	// Flush LZ4 writer and close pipe.
+	// Flush LZ4 writer, encryption writer and close pipe.
 	if err := zw.Close(); err != nil {
+		return err
+	} else if err := ew.Close(); err != nil {
 		return err
 	} else if err := pw.Close(); err != nil {
 		return err
@@ -341,6 +360,15 @@ func (r *Replica) calcPos(ctx context.Context, generation string) (pos Pos, err 
 		return pos, fmt.Errorf("wal segment reader: %w", err)
 	}
 	defer rd.Close()
+
+	if len(r.AgeIdentities) > 0 {
+		drd, err := age.Decrypt(rd, r.AgeIdentities...)
+		if err != nil {
+			return pos, err
+		}
+
+		rd = ioutil.NopCloser(drd)
+	}
 
 	n, err := io.Copy(ioutil.Discard, lz4.NewReader(rd))
 	if err != nil {
@@ -478,7 +506,23 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 	// Copy the database file to the LZ4 writer in a separate goroutine.
 	var g errgroup.Group
 	g.Go(func() error {
-		zr := lz4.NewWriter(pw)
+		var wc io.WriteCloser = pw
+
+		// Add encryption if we have recipients.
+		if len(r.AgeRecipients) > 0 {
+			// We need to ensure the pipe is closed.
+			defer pw.Close()
+
+			var err error
+			wc, err = age.Encrypt(pw, r.AgeRecipients...)
+			defer wc.Close()
+			if err != nil {
+				pw.CloseWithError(err)
+				return err
+			}
+		}
+
+		zr := lz4.NewWriter(wc)
 		defer zr.Close()
 
 		if _, err := io.Copy(zr, r.f); err != nil {
@@ -488,7 +532,7 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 			pw.CloseWithError(err)
 			return err
 		}
-		return pw.Close()
+		return wc.Close()
 	})
 
 	log.Printf("%s(%s): write snapshot %s/%08x", r.db.Path(), r.Name(), pos.Generation, pos.Index)
@@ -1273,6 +1317,15 @@ func (r *Replica) restoreSnapshot(ctx context.Context, generation string, index 
 	}
 	defer rd.Close()
 
+	if len(r.AgeIdentities) > 0 {
+		drd, err := age.Decrypt(rd, r.AgeIdentities...)
+		if err != nil {
+			return 0, err
+		}
+
+		rd = ioutil.NopCloser(drd)
+	}
+
 	if bytes, err := io.Copy(f, lz4.NewReader(rd)); err != nil {
 		return 0, err
 	} else if err := f.Sync(); err != nil {
@@ -1300,6 +1353,16 @@ func (r *Replica) downloadWAL(ctx context.Context, generation string, index int,
 			return err
 		}
 		defer rd.Close()
+
+		if len(r.AgeIdentities) > 0 {
+			drd, err := age.Decrypt(rd, r.AgeIdentities...)
+			if err != nil {
+				return err
+			}
+
+			rd = ioutil.NopCloser(drd)
+		}
+
 		readers = append(readers, lz4.NewReader(rd))
 	}
 
