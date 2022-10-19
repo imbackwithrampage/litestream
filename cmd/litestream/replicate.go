@@ -42,7 +42,6 @@ func NewReplicateCommand() *ReplicateCommand {
 func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
-	tracePath := fs.String("trace", "", "trace path")
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -81,14 +80,7 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 	}
 
 	// Enable trace logging.
-	if *tracePath != "" {
-		f, err := os.Create(*tracePath)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		litestream.Tracef = log.New(f, "", log.LstdFlags|log.Lmicroseconds|log.LUTC|log.Lshortfile).Printf
-	}
+	litestream.Tracef = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds|log.LUTC|log.Lshortfile).Printf
 
 	return nil
 }
