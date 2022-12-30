@@ -11,7 +11,12 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 
 FROM alpine
-RUN apk add --no-cache sqlite # for debugging
+
+# for debugging
+RUN apk add --no-cache sqlite && \
+    printf '#!/bin/sh\nexec /usr/bin/sqlite3 -cmd "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA busy_timeout=5000;" "$@"\n' > /usr/local/bin/sqlite3 && \
+    chmod +x /usr/local/bin/sqlite3
+
 COPY --from=builder /usr/local/bin/litestream /usr/local/bin/litestream
 ENTRYPOINT ["/usr/local/bin/litestream"]
 CMD []
