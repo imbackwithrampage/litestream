@@ -9,14 +9,22 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 	--mount=type=cache,target=/go/pkg \
 	go build -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}' -extldflags '-static'" -tags osusergo,netgo,sqlite_omit_load_extension -o /usr/local/bin/litestream ./cmd/litestream
 
+# to make copy a single layer later
+COPY etc/sqlite3 etc/aws-k8s-sa-provider /usr/local/bin/
 
 FROM alpine
+ENV AWS_SDK_LOAD_CONFIG=1
 
 # for debugging
 RUN apk add --no-cache sqlite && \
-    printf '#!/bin/sh\nexec /usr/bin/sqlite3 -cmd "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA busy_timeout=5000;" "$@"\n' > /usr/local/bin/sqlite3 && \
-    chmod +x /usr/local/bin/sqlite3
+    mkdir /root/.aws
 
-COPY --from=builder /usr/local/bin/litestream /usr/local/bin/litestream
+COPY etc/aws-config /root/.aws/config
+COPY --from=builder \
+     /usr/local/bin/litestream \
+     /usr/local/bin/sqlite3 \
+     /usr/local/bin/aws-k8s-sa-provider \
+     /usr/local/bin/
+
 ENTRYPOINT ["/usr/local/bin/litestream"]
 CMD []
