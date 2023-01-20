@@ -13,13 +13,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 COPY etc/sqlite3 etc/aws-k8s-sa-provider /usr/local/bin/
 
 FROM alpine
-ENV AWS_SDK_LOAD_CONFIG=1
+ENV AWS_SDK_LOAD_CONFIG=1 \
+    AWS_CONFIG_FILE=/etc/aws-config
 
 # for debugging
 RUN apk add --no-cache sqlite && \
     mkdir /root/.aws
 
-COPY etc/aws-config /root/.aws/config
+COPY etc/aws-config /etc/
 COPY --from=builder \
      /usr/local/bin/litestream \
      /usr/local/bin/sqlite3 \
