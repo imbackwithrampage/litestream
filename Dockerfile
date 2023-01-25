@@ -16,9 +16,8 @@ FROM alpine
 ENV AWS_SDK_LOAD_CONFIG=1 \
     AWS_CONFIG_FILE=/etc/aws-config
 
-# for debugging
-RUN apk add --no-cache sqlite && \
-    mkdir /root/.aws
+# for debugging and cleanup
+RUN apk add --no-cache sqlite aws-cli
 
 COPY etc/aws-config /etc/
 COPY --from=builder \
