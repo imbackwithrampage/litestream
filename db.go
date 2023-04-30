@@ -11,7 +11,6 @@ import (
 	"hash/crc64"
 	"io"
 	"io/ioutil"
-	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -23,6 +22,7 @@ import (
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"golang.org/x/exp/slog"
 )
 
 // Default DB settings.
@@ -94,6 +94,9 @@ type DB struct {
 	// List of replicas for the database.
 	// Must be set before calling Open().
 	Replicas []*Replica
+
+	// Logger.
+	Logger *slog.Logger
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -106,6 +109,7 @@ func NewDB(path string) *DB {
 		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
 		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
+		Logger:             slog.With("db", path),
 	}
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
@@ -459,7 +463,7 @@ func (db *DB) init() (err error) {
 
 	// If we have an existing shadow WAL, ensure the headers match.
 	if err := db.verifyHeadersMatch(); err != nil {
-		log.Printf("%s: init: cannot determine last wal position, clearing generation; %s", db.path, err)
+		db.Logger.Info("init: cannot determine last wal position, clearing generation", "error", err)
 		if err := os.Remove(db.GenerationNamePath()); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove generation name: %w", err)
 		}
@@ -701,7 +705,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	if err := db.init(); err != nil {
 		return err
 	} else if db.db == nil {
-		Tracef("%s: sync: no database found", db.path)
+		db.Logger.Debug("sync: no database found")
 		return nil
 	}
 
@@ -727,7 +731,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot verify wal state: %w", err)
 	}
-	Tracef("%s: sync: info=%#v", db.path, info)
+	db.Logger.Debug("sync", "info", &info)
 
 	// Track if anything in the shadow WAL changes and then notify at the end.
 	changed := info.walSize != info.shadowWALSize || info.restart || info.reason != ""
@@ -738,7 +742,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		if info.generation, err = db.createGeneration(); err != nil {
 			return fmt.Errorf("create generation: %w", err)
 		}
-		log.Printf("%s: sync: new generation %q, %s", db.path, info.generation, info.reason)
+		db.Logger.Info("sync: new generation", "generation", info.generation, "reason", info.reason)
 
 		// Clear shadow wal info.
 		info.shadowWALPath = db.ShadowWALPath(info.generation, 0)
@@ -792,7 +796,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		db.notify = make(chan struct{})
 	}
 
-	Tracef("%s: sync: ok", db.path)
+	db.Logger.Debug("sync: ok")
 
 	return nil
 }
@@ -983,7 +987,8 @@ func (db *DB) initShadowWALFile(filename string) (int64, error) {
 }
 
 func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
-	Tracef("%s: copy-shadow: %s", db.path, filename)
+	logger := db.Logger.With("filename", filename)
+	logger.Debug("copy-shadow")
 
 	r, err := os.Open(db.WALPath())
 	if err != nil {
@@ -1038,7 +1043,7 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 	for {
 		// Read next page from WAL file.
 		if _, err := io.ReadFull(r, frame); err == io.EOF || err == io.ErrUnexpectedEOF {
-			Tracef("%s: copy-shadow: break %s @ %d; err=%s", db.path, filename, offset, err)
+			logger.Debug("copy-shadow: break", "offset", offset, "error", err)
 			break // end of file or partial page
 		} else if err != nil {
 			return 0, fmt.Errorf("read wal: %w", err)
@@ -1048,7 +1053,7 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 		salt0 := binary.BigEndian.Uint32(frame[8:])
 		salt1 := binary.BigEndian.Uint32(frame[12:])
 		if salt0 != hsalt0 || salt1 != hsalt1 {
-			Tracef("%s: copy-shadow: break: salt mismatch", db.path)
+			logger.Debug("copy-shadow: break: salt mismatch")
 			break
 		}
 
@@ -1058,14 +1063,14 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 		chksum0, chksum1 = Checksum(bo, chksum0, chksum1, frame[:8])  // frame header
 		chksum0, chksum1 = Checksum(bo, chksum0, chksum1, frame[24:]) // frame data
 		if chksum0 != fchksum0 || chksum1 != fchksum1 {
-			Tracef("%s: copy shadow: checksum mismatch, skipping: offset=%d (%x,%x) != (%x,%x)", db.path, offset, chksum0, chksum1, fchksum0, fchksum1)
+			logger.Debug("copy shadow: checksum mismatch, skipping", "offset", offset, "check", fmt.Sprintf("(%x,%x) != (%x,%x)", chksum0, chksum1, fchksum0, fchksum1))
 			break
 		}
 
 		// Add page to the new size of the shadow WAL.
 		buf.Write(frame)
 
-		Tracef("%s: copy-shadow: ok %s offset=%d salt=%x %x", db.path, filename, offset, salt0, salt1)
+		logger.Debug("copy-shadow: ok", "offset", offset, "salt", fmt.Sprintf("%x %x", salt0, salt1))
 		offset += int64(len(frame))
 
 		// Flush to shadow WAL if commit record.
@@ -1352,7 +1357,7 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 	if err := db.db.QueryRow(rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
 		return err
 	}
-	Tracef("%s: checkpoint: mode=%v (%d,%d,%d)", db.path, mode, row[0], row[1], row[2])
+	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d"), row[0], row[1], row[2])
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(); err != nil {
@@ -1377,7 +1382,7 @@ func (db *DB) monitor() {
 
 		// Sync the database to the shadow WAL.
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("%s: sync error: %s", db.path, err)
+			db.Logger.Error("sync error", "error", err)
 		}
 	}
 }
@@ -1508,10 +1513,6 @@ type RestoreOptions struct {
 
 	// Specifies how many WAL files are downloaded in parallel during restore.
 	Parallelism int
-
-	// Logging settings.
-	Logger  *log.Logger
-	Verbose bool
 }
 
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.

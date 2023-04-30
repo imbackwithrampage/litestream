@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/url"
 	"os"
 	"os/user"
@@ -24,6 +23,7 @@ import (
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/exp/slog"
 	"gopkg.in/yaml.v2"
 )
 
@@ -36,13 +36,11 @@ var (
 var errStop = errors.New("stop")
 
 func main() {
-	log.SetFlags(0)
-
 	m := NewMain()
 	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errStop {
 		os.Exit(1)
 	} else if err != nil {
-		log.Println(err)
+		slog.Error("failed to run", "error", err)
 		os.Exit(1)
 	}
 }
@@ -174,6 +172,16 @@ type Config struct {
 	// Global S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
 	SecretAccessKey string `yaml:"secret-access-key"`
+
+	// Logging
+	Logging LoggingConfig `yaml:"logging"`
+}
+
+// LoggingConfig configures logging.
+type LoggingConfig struct {
+	Level  string `yaml:"level"`
+	Type   string `yaml:"type"`
+	Stderr bool   `yaml:"stderr"`
 }
 
 // propagateGlobalSettings copies global S3 settings to replica configs.
@@ -242,6 +250,36 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 
 	// Propage settings from global config to replica configs.
 	config.propagateGlobalSettings()
+
+	// Configure logging.
+	logOutput := os.Stdout
+	if config.Logging.Stderr {
+		logOutput = os.Stderr
+	}
+
+	logOptions := slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}
+
+	switch strings.ToUpper(config.Logging.Level) {
+	case "DEBUG":
+		logOptions.Level = slog.LevelDebug
+	case "WARN", "WARNING":
+		logOptions.Level = slog.LevelWarn
+	case "ERROR":
+		logOptions.Level = slog.LevelError
+	}
+
+	var logHandler slog.Handler
+	switch config.Logging.Type {
+	case "json":
+		logHandler = logOptions.NewJSONHandler(logOutput)
+	case "text", "":
+		logHandler = logOptions.NewTextHandler(logOutput)
+	}
+
+	// Set global default logger.
+	slog.SetDefault(slog.New(logHandler))
 
 	return config, nil
 }

@@ -7,7 +7,6 @@ import (
 	"hash/crc64"
 	"io"
 	"io/ioutil"
-	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -19,6 +18,7 @@ import (
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"golang.org/x/exp/slog"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -92,6 +92,10 @@ func (r *Replica) Name() string {
 	return r.name
 }
 
+func (r *Replica) Logger() *slog.Logger {
+	return r.db.Logger.With("replica", r.Name())
+}
+
 // DB returns a reference to the database the replica is attached to, if any.
 func (r *Replica) DB() *DB { return r.db }
 
@@ -157,7 +161,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	}
 	generation := dpos.Generation
 
-	Tracef("%s(%s): replica sync: db.pos=%s", r.db.Path(), r.Name(), dpos)
+	r.Logger().Debug("replica sync", "db_position", &dpos)
 
 	// Create a new snapshot and update the current replica position if
 	// the generation on the database has changed.
@@ -179,7 +183,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 			return fmt.Errorf("cannot determine replica position: %s", err)
 		}
 
-		Tracef("%s(%s): replica sync: calc new pos: %s", r.db.Path(), r.Name(), pos)
+		r.Logger().Debug("replica sync: calc new pos", "position", &pos)
 		r.mu.Lock()
 		r.pos = pos
 		r.mu.Unlock()
@@ -213,6 +217,12 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	// Obtain initial position from shadow reader.
 	// It may have moved to the next index if previous position was at the end.
 	pos := rd.Pos()
+	initialPos := pos
+	startTime := time.Now()
+	var bytesWritten int
+
+	logger := r.Logger()
+	logger.Info("write wal segment", "position", &initialPos)
 
 	// Copy through pipe into client from the starting position.
 	var g errgroup.Group
@@ -242,6 +252,7 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 			return err
 		}
 		walBytesCounter.Add(float64(n))
+		bytesWritten += n
 	}
 
 	// Copy frames.
@@ -268,6 +279,7 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 			return err
 		}
 		walBytesCounter.Add(float64(n))
+		bytesWritten += n
 	}
 
 	// Flush LZ4 writer and close pipe.
@@ -291,6 +303,7 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
 	replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
 
+	logger.Info("wal segment written", "position", &initialPos, "elapsed", time.Since(startTime).String(), "sz", bytesWritten)
 	return nil
 }
 
@@ -483,6 +496,10 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 		return pw.Close()
 	})
 
+	logger := r.Logger()
+	logger.Info("write snapshot", "position", &pos)
+
+	startTime := time.Now()
 	// Delegate write to client & wait for writer goroutine to finish.
 	if info, err = r.Client.WriteSnapshot(ctx, pos.Generation, pos.Index, pr); err != nil {
 		return info, err
@@ -490,8 +507,7 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 		return info, err
 	}
 
-	log.Printf("%s(%s): snapshot written %s/%08x", r.db.Path(), r.Name(), pos.Generation, pos.Index)
-
+	logger.Info("snapshot written", "position", &pos, "elapsed", time.Since(startTime).String(), "sz", info.Size)
 	return info, nil
 }
 
@@ -558,7 +574,7 @@ func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, generation str
 		if err := r.Client.DeleteSnapshot(ctx, info.Generation, info.Index); err != nil {
 			return fmt.Errorf("delete snapshot %s/%08x: %w", info.Generation, info.Index, err)
 		}
-		log.Printf("%s(%s): snapshot deleted %s/%08x", r.db.Path(), r.Name(), generation, index)
+		r.Logger().Info("snapshot deleted", "generation", generation, "index", index)
 	}
 
 	return itr.Close()
@@ -590,7 +606,7 @@ func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, generation s
 	if err := r.Client.DeleteWALSegments(ctx, a); err != nil {
 		return fmt.Errorf("delete wal segments: %w", err)
 	}
-	log.Printf("%s(%s): wal segmented deleted before %s/%08x: n=%d", r.db.Path(), r.Name(), generation, index, len(a))
+	r.Logger().Info("wal segmented deleted before", "generation", generation, "index", index, "n", len(a))
 
 	return nil
 }
@@ -627,7 +643,7 @@ func (r *Replica) monitor(ctx context.Context) {
 
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.Sync(ctx); err != nil {
-			log.Printf("%s(%s): monitor error: %s", r.db.Path(), r.Name(), err)
+			r.Logger().Error("monitor error", "error", err)
 			continue
 		}
 	}
@@ -655,7 +671,7 @@ func (r *Replica) retainer(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := r.EnforceRetention(ctx); err != nil {
-				log.Printf("%s(%s): retainer error: %s", r.db.Path(), r.Name(), err)
+				r.Logger().Error("retainer error", "error", err)
 				continue
 			}
 		}
@@ -677,7 +693,7 @@ func (r *Replica) snapshotter(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if _, err := r.Snapshot(ctx); err != nil && err != ErrNoGeneration {
-				log.Printf("%s(%s): snapshotter error: %s", r.db.Path(), r.Name(), err)
+				r.Logger().Error("snapshotter error", "error", err)
 				continue
 			}
 		}
@@ -705,7 +721,7 @@ func (r *Replica) validator(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := r.Validate(ctx); err != nil {
-				log.Printf("%s(%s): validation error: %s", r.db.Path(), r.Name(), err)
+				r.Logger().Error("validation error", "error", err)
 				continue
 			}
 		}
@@ -742,7 +758,6 @@ func (r *Replica) Validate(ctx context.Context) error {
 		ReplicaName: r.Name(),
 		Generation:  pos.Generation,
 		Index:       pos.Index - 1,
-		Logger:      log.New(os.Stderr, "", 0),
 	}); err != nil {
 		return fmt.Errorf("cannot restore: %w", err)
 	}
@@ -767,7 +782,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 	if mismatch {
 		status = "mismatch"
 	}
-	log.Printf("%s(%s): validator: status=%s db=%016x replica=%016x pos=%s", db.Path(), r.Name(), status, chksum0, chksum1, pos)
+	r.Logger().Info("validator", "status", status, "db", fmt.Sprintf("%016x", chksum0), "replica", fmt.Sprintf("%016x", chksum1), "position", &pos)
 
 	// Validate checksums match.
 	if mismatch {
@@ -785,8 +800,6 @@ func (r *Replica) Validate(ctx context.Context) error {
 
 // waitForReplica blocks until replica reaches at least the given position.
 func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
-	db := r.DB()
-
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -809,7 +822,7 @@ func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
 		// Obtain current position of replica, check if past target position.
 		curr := r.Pos()
 		if curr.IsZero() {
-			log.Printf("%s(%s): validator: no replica position available", db.Path(), r.Name())
+			r.Logger().Info("validator: no replica position available")
 			continue
 		}
 
@@ -961,17 +974,6 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot specify index & timestamp to restore")
 	}
 
-	// Ensure logger exists.
-	logger := opt.Logger
-	if logger == nil {
-		logger = log.New(ioutil.Discard, "", 0)
-	}
-
-	logPrefix := r.Name()
-	if db := r.DB(); db != nil {
-		logPrefix = fmt.Sprintf("%s(%s)", db.Path(), r.Name())
-	}
-
 	// Ensure output path does not already exist.
 	if _, err := os.Stat(opt.OutputPath); err == nil {
 		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
@@ -1018,19 +1020,19 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	tmpPath := opt.OutputPath + ".tmp"
 
 	// Copy snapshot to output path.
-	logger.Printf("%s: restoring snapshot %s/%08x to %s", logPrefix, opt.Generation, minWALIndex, tmpPath)
+	r.Logger().Info("restoring snapshot", "generation", opt.Generation, "index", minWALIndex, "path", tmpPath)
 	if err := r.restoreSnapshot(ctx, pos.Generation, pos.Index, tmpPath); err != nil {
 		return fmt.Errorf("cannot restore snapshot: %w", err)
 	}
 
 	// If no WAL files available, move snapshot to final path & exit early.
 	if snapshotOnly {
-		logger.Printf("%s: snapshot only, finalizing database", logPrefix)
+		r.Logger().Info("snapshot only, finalizing database")
 		return os.Rename(tmpPath, opt.OutputPath)
 	}
 
 	// Begin processing WAL files.
-	logger.Printf("%s: restoring wal files: generation=%s index=[%08x,%08x]", logPrefix, opt.Generation, minWALIndex, maxWALIndex)
+	r.Logger().Info("restoring wal files", "generation", opt.Generation, "index_min", minWALIndex, "index_max", maxWALIndex)
 
 	// Fill input channel with all WAL indexes to be loaded in order.
 	// Verify every index has at least one offset.
@@ -1086,9 +1088,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 						return err
 					}
 
-					logger.Printf("%s: downloaded wal %s/%08x elapsed=%s",
-						logPrefix, opt.Generation, index,
-						time.Since(startTime).String(),
+					r.Logger().Info("downloaded wal",
+						"generation", opt.Generation, "index", index,
+						"elapsed", time.Since(startTime).String(),
 					)
 				}
 			}
@@ -1115,10 +1117,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		if err = applyWAL(ctx, index, tmpPath); err != nil {
 			return fmt.Errorf("cannot apply wal: %w", err)
 		}
-		logger.Printf("%s: applied wal %s/%08x elapsed=%s",
-			logPrefix, opt.Generation, index,
-			time.Since(startTime).String(),
-		)
+		r.Logger().Info("applied wal", "generation", opt.Generation, "index", index, "elapsed", time.Since(startTime).String())
 	}
 
 	// Ensure all goroutines finish. All errors should have been handled during
@@ -1128,7 +1127,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	// Copy file to final location.
-	logger.Printf("%s: renaming database from temporary location", logPrefix)
+	r.Logger().Info("renaming database from temporary location")
 	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
 		return err
 	}

@@ -4,12 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"text/tabwriter"
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"golang.org/x/exp/slog"
 )
 
 // SnapshotsCommand represents a command to list snapshots for a command.
@@ -82,7 +82,7 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	for _, r := range replicas {
 		infos, err := r.Snapshots(ctx)
 		if err != nil {
-			log.Printf("cannot determine snapshots: %s", err)
+			slog.Error("cannot determine snapshots", "error", err)
 			continue
 		}
 		for _, info := range infos {
